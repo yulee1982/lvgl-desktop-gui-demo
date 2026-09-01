@@ -1,0 +1,14 @@
+prefix=/home/yulee/work/s5p6818/gui_lv_v9.5/lv_port_linux-release-v9.5/thirdpart/ffmpeg-9.0.1
+exec_prefix=${prefix}
+libdir=/usr/local/ffmpeg-9.0.1-aarch64/lib
+includedir=/usr/local/ffmpeg-9.0.1-aarch64/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 61.1.101
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -latomic -pthread
+Cflags: -I${includedir}
