@@ -1,0 +1,1165 @@
+/**
+ * @file lv_ffmpeg.c
+ *
+ */
+ 
+/*********************
+ *      INCLUDES
+ *********************/
+#include "lv_ffmpeg.h"
+#if LV_USE_FFMPEG != 0
+ 
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
+#include <libavutil/timestamp.h>
+#include <libswscale/swscale.h>
+#include <libavutil/time.h>
+#include <pthread.h>
+#include <semaphore.h>
+ 
+/*********************
+ *      DEFINES
+ *********************/
+#if LV_COLOR_DEPTH == 1 || LV_COLOR_DEPTH == 8
+    #define AV_PIX_FMT_TRUE_COLOR AV_PIX_FMT_RGB8
+#elif LV_COLOR_DEPTH == 16
+    #if LV_COLOR_16_SWAP == 0
+        #define AV_PIX_FMT_TRUE_COLOR AV_PIX_FMT_RGB565LE
+    #else
+        #define AV_PIX_FMT_TRUE_COLOR AV_PIX_FMT_RGB565BE
+    #endif
+#elif LV_COLOR_DEPTH == 32
+    #define AV_PIX_FMT_TRUE_COLOR AV_PIX_FMT_BGR0
+#else
+    #error Unsupported  LV_COLOR_DEPTH
+#endif
+ 
+#define MY_CLASS &lv_ffmpeg_player_class
+ 
+#define FRAME_DEF_REFR_PERIOD   33  /*[ms]*/
+#define MAX_CACHE_FRAMES 2      // 2缓存
+#define DECODER_THREADS 2       // 解码线程数
+ 
+/**********************
+ *      TYPEDEFS
+ **********************/
+// 帧缓存结构
+typedef struct {
+    uint8_t *data;              // 帧数据
+    int64_t pts;                // 显示时间戳
+    int64_t duration;           // 帧持续时间
+    bool ready;                 // 是否就绪
+} frame_cache_t;
+ 
+struct ffmpeg_context_s {
+    AVFormatContext * fmt_ctx;
+    AVCodecContext * video_dec_ctx;
+    AVStream * video_stream;
+    struct SwsContext * sws_ctx;
+    AVFrame * frame;
+    AVPacket *pkt;
+    int video_stream_idx;
+    enum AVPixelFormat video_dst_pix_fmt;
+    bool has_alpha;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t src_width;
+    uint32_t src_height;
+    uint32_t frame_period;
+    bool needs_realloc;
+ 
+    // 多线程和2缓存相关字段
+    frame_cache_t frame_cache[MAX_CACHE_FRAMES]; // 2缓存
+    int current_cache_idx;      // 当前显示的缓存索引
+    int next_cache_idx;         // 下一个可用的缓存索引
+    pthread_t decode_thread;    // 解码线程
+    pthread_mutex_t cache_mutex; // 缓存互斥锁
+    sem_t decode_sem;           // 解码信号量
+    bool decoding;              // 解码线程运行标志
+    bool seek_pending;          // 是否有跳转请求
+    int64_t seek_target;        // 跳转目标位置
+};
+ 
+#pragma pack(1)
+ 
+struct lv_img_pixel_color_s {
+    lv_color_t c;
+    uint8_t alpha;
+};
+ 
+#pragma pack()
+ 
+/**********************
+ *  STATIC PROTOTYPES
+ **********************/
+ 
+static lv_res_t decoder_info(lv_img_decoder_t * decoder, const void * src, lv_img_header_t * header);
+static lv_res_t decoder_open(lv_img_decoder_t * dec, lv_img_decoder_dsc_t * dsc);
+static void decoder_close(lv_img_decoder_t * dec, lv_img_decoder_dsc_t * dsc);
+ 
+static struct ffmpeg_context_s * ffmpeg_open_file(const char * path);
+static void ffmpeg_close(struct ffmpeg_context_s * ffmpeg_ctx);
+static void ffmpeg_close_src_ctx(struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_image_allocate(struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_get_img_header(const char * path, lv_img_header_t * header);
+static int ffmpeg_get_frame_refr_period(struct ffmpeg_context_s * ffmpeg_ctx);
+static uint8_t * ffmpeg_get_img_data(struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx);
+static bool ffmpeg_pix_fmt_has_alpha(enum AVPixelFormat pix_fmt);
+static bool ffmpeg_pix_fmt_is_yuv(enum AVPixelFormat pix_fmt);
+ 
+static void lv_ffmpeg_player_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
+static void lv_ffmpeg_player_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
+ 
+// 多线程解码函数
+static void * decode_thread_func(void * arg);
+static int get_next_cache_index(struct ffmpeg_context_s * ffmpeg_ctx);
+static void seek_video(struct ffmpeg_context_s * ffmpeg_ctx, int64_t target);
+ 
+#if LV_COLOR_DEPTH != 32
+    static void convert_color_depth(uint8_t * img, uint32_t px_cnt);
+#endif
+ 
+/**********************
+ *  STATIC VARIABLES
+ **********************/
+const lv_obj_class_t lv_ffmpeg_player_class = {
+    .constructor_cb = lv_ffmpeg_player_constructor,
+    .destructor_cb = lv_ffmpeg_player_destructor,
+    .instance_size = sizeof(lv_ffmpeg_player_t),
+    .base_class = &lv_img_class
+};
+ 
+/**********************
+ *      MACROS
+ **********************/
+ 
+/**********************
+ *   GLOBAL FUNCTIONS
+ **********************/
+ 
+void lv_ffmpeg_init(void)
+{
+    lv_img_decoder_t * dec = lv_img_decoder_create();
+    lv_img_decoder_set_info_cb(dec, decoder_info);
+    lv_img_decoder_set_open_cb(dec, decoder_open);
+    lv_img_decoder_set_close_cb(dec, decoder_close);
+ 
+#if LV_FFMPEG_AV_DUMP_FORMAT == 0
+    av_log_set_level(AV_LOG_QUIET);
+#endif
+}
+ 
+int lv_ffmpeg_get_frame_num(const char * path)
+{
+    int ret = -1;
+    struct ffmpeg_context_s * ffmpeg_ctx = ffmpeg_open_file(path);
+ 
+    if(ffmpeg_ctx) {
+        ret = ffmpeg_ctx->video_stream->nb_frames;
+        ffmpeg_close(ffmpeg_ctx);
+    }
+ 
+    return ret;
+}
+ 
+lv_obj_t * lv_ffmpeg_player_create(lv_obj_t * parent)
+{
+    lv_obj_t * obj = lv_obj_class_create_obj(MY_CLASS, parent);
+    lv_obj_class_init_obj(obj);
+    return obj;
+}
+ 
+lv_res_t lv_ffmpeg_player_set_src(lv_obj_t * obj, const char * path)
+{
+    LV_ASSERT_OBJ(obj, MY_CLASS);
+    lv_res_t res = LV_RES_INV;
+ 
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+ 
+    if(player->ffmpeg_ctx) {
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
+    }
+ 
+    lv_timer_pause(player->timer);
+ 
+    player->ffmpeg_ctx = ffmpeg_open_file(path);
+ 
+    if(!player->ffmpeg_ctx) {
+        LV_LOG_ERROR("ffmpeg_ctx is NULL");
+        memset(&player->imgdsc, 0, sizeof(lv_img_dsc_t));
+        goto failed;
+    }
+ 
+    lv_obj_update_layout(obj);
+ 
+    // 获取对象当前尺寸作为目标尺寸
+    int obj_width = lv_obj_get_width(obj);
+    int obj_height = lv_obj_get_height(obj);
+    
+    // 如果对象尺寸为0，使用视频原始尺寸
+    if(obj_width <= 0 || obj_height <= 0) {
+        obj_width = player->ffmpeg_ctx->video_dec_ctx->width;
+        obj_height = player->ffmpeg_ctx->video_dec_ctx->height;
+        // 设置对象尺寸
+        lv_obj_set_size(obj, obj_width, obj_height);
+    }
+    
+    // 设置目标尺寸 - 确保不超过视频原始尺寸
+    player->ffmpeg_ctx->target_width = LV_MIN(obj_width, player->ffmpeg_ctx->video_dec_ctx->width);
+    player->ffmpeg_ctx->target_height = LV_MIN(obj_height, player->ffmpeg_ctx->video_dec_ctx->height);
+ 
+    if(ffmpeg_image_allocate(player->ffmpeg_ctx) < 0) {
+        LV_LOG_ERROR("ffmpeg image allocate failed");
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
+        goto failed;
+    }
+ 
+    bool has_alpha = player->ffmpeg_ctx->has_alpha;
+    uint32_t data_size = 0;
+ 
+    // 使用目标尺寸计算数据大小
+    data_size = player->ffmpeg_ctx->target_width * player->ffmpeg_ctx->target_height;
+    data_size *= has_alpha ? LV_IMG_PX_SIZE_ALPHA_BYTE : (LV_COLOR_SIZE / 8);
+ 
+    player->imgdsc.header.always_zero = 0;
+    player->imgdsc.header.w = player->ffmpeg_ctx->target_width;
+    player->imgdsc.header.h = player->ffmpeg_ctx->target_height;
+    player->imgdsc.data_size = data_size;
+    player->imgdsc.header.cf = has_alpha ? LV_IMG_CF_TRUE_COLOR_ALPHA : LV_IMG_CF_TRUE_COLOR;
+    
+    // 使用第一个缓存作为初始显示数据
+    pthread_mutex_lock(&player->ffmpeg_ctx->cache_mutex);
+    player->imgdsc.data = player->ffmpeg_ctx->frame_cache[0].data;
+    pthread_mutex_unlock(&player->ffmpeg_ctx->cache_mutex);
+    
+    if(player->imgdsc.data == NULL) {
+        LV_LOG_ERROR("Failed to get image data");
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
+        goto failed;
+    }
+ 
+    // 设置图像源
+    lv_img_set_src(obj, &(player->imgdsc));
+ 
+    int period = ffmpeg_get_frame_refr_period(player->ffmpeg_ctx);
+    
+    if(period > 0) {
+        player->ffmpeg_ctx->frame_period = period;
+        LV_LOG_INFO("frame refresh period = %d ms, rate = %d fps",
+                    period, 1000 / period);
+        lv_timer_set_period(player->timer, period);
+    }
+    else {
+        player->ffmpeg_ctx->frame_period = FRAME_DEF_REFR_PERIOD;
+        LV_LOG_WARN("unable to get frame refresh period, using default: %d ms", FRAME_DEF_REFR_PERIOD);
+        lv_timer_set_period(player->timer, FRAME_DEF_REFR_PERIOD);
+    }
+ 
+    // 启动解码线程
+    player->ffmpeg_ctx->decoding = true;
+    if(pthread_create(&player->ffmpeg_ctx->decode_thread, NULL, decode_thread_func, player) != 0) {
+        LV_LOG_ERROR("Failed to create decode thread");
+        player->ffmpeg_ctx->decoding = false;
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
+        goto failed;
+    }
+ 
+    res = LV_RES_OK;
+ 
+failed:
+    return res;
+}
+ 
+void lv_ffmpeg_player_set_cmd(lv_obj_t * obj, lv_ffmpeg_player_cmd_t cmd)
+{
+    LV_ASSERT_OBJ(obj, MY_CLASS);
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+ 
+    if(!player->ffmpeg_ctx) {
+        LV_LOG_ERROR("ffmpeg_ctx is NULL");
+        return;
+    }
+ 
+    lv_timer_t * timer = player->timer;
+ 
+    switch(cmd) {
+        case LV_FFMPEG_PLAYER_CMD_START:
+            // 发送跳转到开头的请求
+            pthread_mutex_lock(&player->ffmpeg_ctx->cache_mutex);
+            player->ffmpeg_ctx->seek_pending = true;
+            player->ffmpeg_ctx->seek_target = 0;
+            // 重置所有缓存
+            for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+                player->ffmpeg_ctx->frame_cache[i].ready = false;
+            }
+            player->ffmpeg_ctx->current_cache_idx = 0;
+            player->ffmpeg_ctx->next_cache_idx = 0;
+            pthread_mutex_unlock(&player->ffmpeg_ctx->cache_mutex);
+            
+            // 触发解码线程立即工作
+            sem_post(&player->ffmpeg_ctx->decode_sem);
+            
+            lv_timer_resume(timer);
+            LV_LOG_INFO("ffmpeg player start");
+            break;
+        case LV_FFMPEG_PLAYER_CMD_STOP:
+            pthread_mutex_lock(&player->ffmpeg_ctx->cache_mutex);
+            player->ffmpeg_ctx->seek_pending = true;
+            player->ffmpeg_ctx->seek_target = 0;
+            // 重置所有缓存
+            for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+                player->ffmpeg_ctx->frame_cache[i].ready = false;
+            }
+            player->ffmpeg_ctx->current_cache_idx = 0;
+            player->ffmpeg_ctx->next_cache_idx = 0;
+            pthread_mutex_unlock(&player->ffmpeg_ctx->cache_mutex);
+            
+            lv_timer_pause(timer);
+            LV_LOG_INFO("ffmpeg player stop");
+            break;
+        case LV_FFMPEG_PLAYER_CMD_PAUSE:
+            lv_timer_pause(timer);
+            LV_LOG_INFO("ffmpeg player pause");
+            break;
+        case LV_FFMPEG_PLAYER_CMD_RESUME:
+            lv_timer_resume(timer);
+            LV_LOG_INFO("ffmpeg player resume");
+            break;
+        default:
+            LV_LOG_ERROR("Error cmd: %d", cmd);
+            break;
+    }
+}
+ 
+void lv_ffmpeg_player_set_auto_restart(lv_obj_t * obj, bool en)
+{
+    LV_ASSERT_OBJ(obj, MY_CLASS);
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+    player->auto_restart = en;
+}
+ 
+/**********************
+ *   STATIC FUNCTIONS
+ **********************/
+ 
+static lv_res_t decoder_info(lv_img_decoder_t * decoder, const void * src, lv_img_header_t * header)
+{
+    /* Get the source type */
+    lv_img_src_t src_type = lv_img_src_get_type(src);
+ 
+    if(src_type == LV_IMG_SRC_FILE) {
+        const char * fn = src;
+ 
+        if(ffmpeg_get_img_header(fn, header) < 0) {
+            LV_LOG_ERROR("ffmpeg can't get image header");
+            return LV_RES_INV;
+        }
+ 
+        return LV_RES_OK;
+    }
+ 
+    /* If didn't succeeded earlier then it's an error */
+    return LV_RES_INV;
+}
+ 
+static lv_res_t decoder_open(lv_img_decoder_t * decoder, lv_img_decoder_dsc_t * dsc)
+{
+    if(dsc->src_type == LV_IMG_SRC_FILE) {
+        const char * path = dsc->src;
+ 
+        struct ffmpeg_context_s * ffmpeg_ctx = ffmpeg_open_file(path);
+ 
+        if(ffmpeg_ctx == NULL) {
+            return LV_RES_INV;
+        }
+ 
+        if(ffmpeg_image_allocate(ffmpeg_ctx) < 0) {
+            LV_LOG_ERROR("ffmpeg image allocate failed");
+            ffmpeg_close(ffmpeg_ctx);
+            return LV_RES_INV;
+        }
+ 
+        if(ffmpeg_update_next_frame(ffmpeg_ctx) < 0) {
+            ffmpeg_close(ffmpeg_ctx);
+            LV_LOG_ERROR("ffmpeg update frame failed");
+            return LV_RES_INV;
+        }
+ 
+        ffmpeg_close_src_ctx(ffmpeg_ctx);
+        uint8_t * img_data = ffmpeg_get_img_data(ffmpeg_ctx);
+ 
+#if LV_COLOR_DEPTH != 32
+        if(ffmpeg_ctx->has_alpha) {
+            convert_color_depth(img_data, dsc->header.w * dsc->header.h);
+        }
+#endif
+ 
+        dsc->user_data = ffmpeg_ctx;
+        dsc->img_data = img_data;
+ 
+        /* The image is fully decoded. Return with its pointer */
+        return LV_RES_OK;
+    }
+ 
+    /* If not returned earlier then it failed */
+    return LV_RES_INV;
+}
+ 
+static void decoder_close(lv_img_decoder_t * decoder, lv_img_decoder_dsc_t * dsc)
+{
+    struct ffmpeg_context_s * ffmpeg_ctx = dsc->user_data;
+    ffmpeg_close(ffmpeg_ctx);
+}
+ 
+#if LV_COLOR_DEPTH != 32
+ 
+static void convert_color_depth(uint8_t * img, uint32_t px_cnt)
+{
+    lv_color32_t * img_src_p = (lv_color32_t *)img;
+    struct lv_img_pixel_color_s * img_dst_p = (struct lv_img_pixel_color_s *)img;
+ 
+    for(uint32_t i = 0; i < px_cnt; i++) {
+        lv_color32_t temp = *img_src_p;
+        img_dst_p->c = lv_color_hex(temp.full);
+        img_dst_p->alpha = temp.ch.alpha;
+ 
+        img_src_p++;
+        img_dst_p++;
+    }
+}
+ 
+#endif
+ 
+static uint8_t * ffmpeg_get_img_data(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    if (!ffmpeg_ctx) {
+        LV_LOG_ERROR("Invalid ffmpeg context");
+        return NULL;
+    }
+ 
+    // 直接返回当前显示帧的数据
+    pthread_mutex_lock(&ffmpeg_ctx->cache_mutex);
+    uint8_t * data = ffmpeg_ctx->frame_cache[ffmpeg_ctx->current_cache_idx].data;
+    pthread_mutex_unlock(&ffmpeg_ctx->cache_mutex);
+ 
+    if (!data) {
+        LV_LOG_ERROR("No frame data available");
+        return NULL;
+    }
+ 
+    return data;
+}
+ 
+ 
+static void lv_ffmpeg_player_event_cb(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * obj = lv_event_get_target(e);
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+    
+    if (!player || !player->ffmpeg_ctx) return;
+ 
+    if (code == LV_EVENT_SIZE_CHANGED && player && player->ffmpeg_ctx) {
+        int new_width = lv_obj_get_width(obj);
+        int new_height = lv_obj_get_height(obj);
+        
+        if (new_width > 0 && new_height > 0 && 
+            (player->ffmpeg_ctx->target_width != new_width || 
+             player->ffmpeg_ctx->target_height != new_height)) {
+            
+            player->ffmpeg_ctx->target_width = new_width;
+            player->ffmpeg_ctx->target_height = new_height;
+            player->ffmpeg_ctx->needs_realloc = true;
+            
+            player->imgdsc.header.w = new_width;
+            player->imgdsc.header.h = new_height;
+            
+            LV_LOG_INFO("Size changed to %dx%d", new_width, new_height);
+        }
+    }
+}
+ 
+static bool ffmpeg_pix_fmt_has_alpha(enum AVPixelFormat pix_fmt)
+{
+    const AVPixFmtDescriptor * desc = av_pix_fmt_desc_get(pix_fmt);
+ 
+    if(desc == NULL) {
+        return false;
+    }
+ 
+    if(pix_fmt == AV_PIX_FMT_PAL8) {
+        return true;
+    }
+ 
+    return (desc->flags & AV_PIX_FMT_FLAG_ALPHA) ? true : false;
+}
+ 
+static bool ffmpeg_pix_fmt_is_yuv(enum AVPixelFormat pix_fmt)
+{
+    const AVPixFmtDescriptor * desc = av_pix_fmt_desc_get(pix_fmt);
+ 
+    if(desc == NULL) {
+        return false;
+    }
+ 
+    return !(desc->flags & AV_PIX_FMT_FLAG_RGB) && desc->nb_components >= 2;
+}
+ 
+static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int ret = -1;
+    AVFrame * frame = ffmpeg_ctx->frame;
+ 
+    if (!frame || !frame->data[0]) {
+        LV_LOG_ERROR("Invalid frame data");
+        goto failed;
+    }
+ 
+    if (ffmpeg_ctx->needs_realloc) {
+        if (ffmpeg_ctx->sws_ctx) {
+            sws_freeContext(ffmpeg_ctx->sws_ctx);
+        }
+        
+        // 创建缩放上下文，直接输出到双缓存帧
+        ffmpeg_ctx->sws_ctx = sws_getContext(
+            ffmpeg_ctx->src_width, ffmpeg_ctx->src_height, 
+            ffmpeg_ctx->video_dec_ctx->pix_fmt,
+            ffmpeg_ctx->target_width, ffmpeg_ctx->target_height,
+            ffmpeg_ctx->video_dst_pix_fmt,
+            SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            
+        if (!ffmpeg_ctx->sws_ctx) {
+            LV_LOG_ERROR("Failed to create scaling context");
+            goto failed;
+        }
+        
+        ffmpeg_ctx->needs_realloc = false;
+    }
+ 
+    // 获取当前双缓存帧的数据指针和行大小
+    uint8_t *dst_data[4] = {ffmpeg_ctx->frame_cache[ffmpeg_ctx->next_cache_idx].data, NULL, NULL, NULL};
+    int dst_linesize[4] = {
+        ffmpeg_ctx->target_width * (ffmpeg_ctx->has_alpha ? LV_IMG_PX_SIZE_ALPHA_BYTE : (LV_COLOR_SIZE / 8)),
+        0, 0, 0
+    };
+ 
+    // 直接缩放到双缓存帧
+    ret = sws_scale(
+        ffmpeg_ctx->sws_ctx,
+        (const uint8_t * const *)frame->data,
+        frame->linesize,
+        0, ffmpeg_ctx->src_height,
+        dst_data,
+        dst_linesize);
+ 
+    if (ret <= 0) {
+        LV_LOG_ERROR("sws_scale failed: %d", ret);
+        goto failed;
+    }
+ 
+failed:
+    return ret;
+}
+ 
+ 
+static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt,
+                                struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int ret = 0;
+ 
+    /* submit the packet to the decoder */
+    ret = avcodec_send_packet(dec, pkt);
+    if(ret < 0) {
+        LV_LOG_ERROR("Error submitting a packet for decoding (%s)",
+                     av_err2str(ret));
+        return ret;
+    }
+ 
+    /* get all the available frames from the decoder */
+    while(ret >= 0) {
+        ret = avcodec_receive_frame(dec, ffmpeg_ctx->frame);
+        if(ret < 0) {
+            if(ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+                return 0;
+            }
+ 
+            LV_LOG_ERROR("Error during decoding (%s)", av_err2str(ret));
+            return ret;
+        }
+ 
+        if(dec->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ret = ffmpeg_output_video_frame(ffmpeg_ctx);
+        }
+ 
+        av_frame_unref(ffmpeg_ctx->frame);
+        if(ret < 0) {
+            LV_LOG_WARN("ffmpeg_decode_packet ended %d", ret);
+            return ret;
+        }
+    }
+ 
+    return 0;
+}
+ 
+static int ffmpeg_open_codec_context(int * stream_idx,
+                                     AVCodecContext ** dec_ctx, AVFormatContext * fmt_ctx,
+                                     enum AVMediaType type)
+{
+    int ret;
+    int stream_index;
+    AVStream * st;
+    AVCodec * dec = NULL;
+    AVDictionary * opts = NULL;
+ 
+    ret = av_find_best_stream(fmt_ctx, type, -1, -1, NULL, 0);
+    if(ret < 0) {
+        LV_LOG_ERROR("Could not find %s stream in input file",
+                     av_get_media_type_string(type));
+        return ret;
+    }
+    else {
+        stream_index = ret;
+        st = fmt_ctx->streams[stream_index];
+ 
+        /* find decoder for the stream */
+        dec = (AVCodec *)avcodec_find_decoder(st->codecpar->codec_id);
+        if(dec == NULL) {
+            LV_LOG_ERROR("Failed to find %s codec",
+                         av_get_media_type_string(type));
+            return AVERROR(EINVAL);
+        }
+ 
+        /* Allocate a codec context for the decoder */
+        *dec_ctx = avcodec_alloc_context3(dec);
+        if(*dec_ctx == NULL) {
+            LV_LOG_ERROR("Failed to allocate the %s codec context",
+                         av_get_media_type_string(type));
+            return AVERROR(ENOMEM);
+        }
+ 
+        /* Copy codec parameters from input stream to output codec context */
+        if((ret = avcodec_parameters_to_context(*dec_ctx, st->codecpar)) < 0) {
+            LV_LOG_ERROR(
+                "Failed to copy %s codec parameters to decoder context",
+                av_get_media_type_string(type));
+            return ret;
+        }
+ 
+        // 设置多线程解码
+        av_dict_set(&opts, "threads", "auto", 0);
+        (*dec_ctx)->thread_count = DECODER_THREADS;
+ 
+        /* Init the decoders */
+        if((ret = avcodec_open2(*dec_ctx, dec, &opts)) < 0) {
+            LV_LOG_ERROR("Failed to open %s codec",
+                         av_get_media_type_string(type));
+            return ret;
+        }
+ 
+        *stream_idx = stream_index;
+    }
+ 
+    return 0;
+}
+ 
+static int ffmpeg_get_img_header(const char * filepath,
+                                 lv_img_header_t * header)
+{
+    int ret = -1;
+ 
+    AVFormatContext * fmt_ctx = NULL;
+    AVCodecContext * video_dec_ctx = NULL;
+    int video_stream_idx;
+ 
+    /* open input file, and allocate format context */
+    if(avformat_open_input(&fmt_ctx, filepath, NULL, NULL) < 0) {
+        LV_LOG_ERROR("Could not open source file %s", filepath);
+        goto failed;
+    }
+ 
+    /* retrieve stream information */
+    if(avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+        LV_LOG_ERROR("Could not find stream information");
+        goto failed;
+    }
+ 
+    if(ffmpeg_open_codec_context(&video_stream_idx, &video_dec_ctx,
+                                 fmt_ctx, AVMEDIA_TYPE_VIDEO)
+       >= 0) {
+        bool has_alpha = ffmpeg_pix_fmt_has_alpha(video_dec_ctx->pix_fmt);
+ 
+        /* allocate image where the decoded image will be put */
+        header->w = video_dec_ctx->width;
+        header->h = video_dec_ctx->height;
+        header->always_zero = 0;
+        header->cf = (has_alpha ? LV_IMG_CF_TRUE_COLOR_ALPHA : LV_IMG_CF_TRUE_COLOR);
+ 
+        ret = 0;
+    }
+ 
+failed:
+    avcodec_free_context(&video_dec_ctx);
+    avformat_close_input(&fmt_ctx);
+ 
+    return ret;
+}
+ 
+static int ffmpeg_get_frame_refr_period(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int avg_frame_rate_num = ffmpeg_ctx->video_stream->avg_frame_rate.num;
+    if(avg_frame_rate_num > 0) {
+        int period = 1000 * (int64_t)ffmpeg_ctx->video_stream->avg_frame_rate.den
+                     / avg_frame_rate_num;
+        return period;
+    }
+ 
+    return -1;
+}
+ 
+static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int ret = 0;
+ 
+    while(1) {
+        ret = av_read_frame(ffmpeg_ctx->fmt_ctx, ffmpeg_ctx->pkt);
+        if(ret >= 0) {
+            bool is_image = false;
+ 
+            if(ffmpeg_ctx->pkt->stream_index == ffmpeg_ctx->video_stream_idx) {
+                // 直接解码到目标缓存，避免中间拷贝
+                ret = ffmpeg_decode_packet(ffmpeg_ctx->video_dec_ctx,
+                                          ffmpeg_ctx->pkt, ffmpeg_ctx);
+                is_image = true;
+            }
+ 
+            av_packet_unref(ffmpeg_ctx->pkt);
+ 
+            if(ret < 0) {
+                LV_LOG_WARN("video frame is empty %d", ret);
+                break;
+            }
+ 
+            if(is_image) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+ 
+    return ret;
+}
+ 
+ 
+// 解码线程函数
+static void * decode_thread_func(void * arg)
+{
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)arg;
+    struct ffmpeg_context_s * ffmpeg_ctx = player->ffmpeg_ctx;
+    int ret = 0;
+     
+    while(ffmpeg_ctx->decoding) {
+        sem_wait(&ffmpeg_ctx->decode_sem);
+        if(!ffmpeg_ctx->decoding) break;
+        
+        // 检查跳转请求
+        pthread_mutex_lock(&ffmpeg_ctx->cache_mutex);
+        if(ffmpeg_ctx->seek_pending) {
+            seek_video(ffmpeg_ctx, ffmpeg_ctx->seek_target);
+            ffmpeg_ctx->seek_pending = false;
+            for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+                ffmpeg_ctx->frame_cache[i].ready = false;
+            }
+            ffmpeg_ctx->current_cache_idx = 0;
+            ffmpeg_ctx->next_cache_idx = 0;
+        }
+        pthread_mutex_unlock(&ffmpeg_ctx->cache_mutex);
+        
+        // 获取可用缓存
+        int cache_idx = get_next_cache_index(ffmpeg_ctx);
+        if(cache_idx < 0) {
+            int64_t current_time = av_gettime();
+            for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+                if(ffmpeg_ctx->frame_cache[i].ready && 
+                   current_time - ffmpeg_ctx->frame_cache[i].pts > 100000) {
+                    cache_idx = i;
+                    break;
+                }
+            }
+        }
+ 
+        // 解码下一帧，直接写入目标缓存
+        ret = ffmpeg_update_next_frame(ffmpeg_ctx);
+        if(ret < 0) {
+            if(ret == AVERROR_EOF) {
+                LV_LOG_INFO("End of video stream");
+                lv_ffmpeg_player_set_cmd((lv_obj_t *)player, player->auto_restart ? LV_FFMPEG_PLAYER_CMD_START : LV_FFMPEG_PLAYER_CMD_STOP);
+            } else {
+                LV_LOG_ERROR("Error decoding frame: %d", ret);
+                break;
+            }
+        }
+ 
+        // 直接更新帧信息，无需数据拷贝
+        pthread_mutex_lock(&ffmpeg_ctx->cache_mutex);
+        ffmpeg_ctx->frame_cache[cache_idx].pts = ffmpeg_ctx->frame->pts;
+        ffmpeg_ctx->frame_cache[cache_idx].duration = 
+            av_rescale_q(1, ffmpeg_ctx->video_stream->time_base, 
+                        (AVRational){1, 1000});
+        ffmpeg_ctx->frame_cache[cache_idx].ready = true;
+        ffmpeg_ctx->next_cache_idx = (cache_idx + 1) % MAX_CACHE_FRAMES;
+        pthread_mutex_unlock(&ffmpeg_ctx->cache_mutex);
+    }
+    return NULL;
+}
+ 
+ 
+// 获取下一个可用的缓存索引
+static int get_next_cache_index(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    pthread_mutex_lock(&ffmpeg_ctx->cache_mutex);
+    
+    // 检查下一个缓存是否就绪
+    if(ffmpeg_ctx->frame_cache[ffmpeg_ctx->next_cache_idx].ready) {
+        // 缓存已满，返回-1表示需要等待
+        pthread_mutex_unlock(&ffmpeg_ctx->cache_mutex);
+        return -1;
+    }
+    
+    int cache_idx = ffmpeg_ctx->next_cache_idx;
+    pthread_mutex_unlock(&ffmpeg_ctx->cache_mutex);
+    return cache_idx;
+}
+ 
+// 跳转到指定位置
+static void seek_video(struct ffmpeg_context_s * ffmpeg_ctx, int64_t target)
+{
+    int ret = av_seek_frame(ffmpeg_ctx->fmt_ctx,
+                           ffmpeg_ctx->video_stream_idx,
+                           target, AVSEEK_FLAG_BACKWARD);
+    if(ret < 0) {
+        LV_LOG_ERROR("Seek failed: %s", av_err2str(ret));
+        return;
+    }
+    
+    // 清空解码器缓冲区
+    avcodec_flush_buffers(ffmpeg_ctx->video_dec_ctx);
+    
+    LV_LOG_INFO("Seek to position: %lld", target);
+}
+ 
+struct ffmpeg_context_s * ffmpeg_open_file(const char * path)
+{
+    if(path == NULL || strlen(path) == 0) {
+        LV_LOG_ERROR("file path is empty");
+        return NULL;
+    }
+ 
+    struct ffmpeg_context_s * ffmpeg_ctx = calloc(1, sizeof(struct ffmpeg_context_s));
+ 
+    if(ffmpeg_ctx == NULL) {
+        LV_LOG_ERROR("ffmpeg_ctx malloc failed");
+        goto failed;
+    }
+ 
+    // 初始化所有字段
+    ffmpeg_ctx->target_width = 0;
+    ffmpeg_ctx->target_height = 0;
+    ffmpeg_ctx->src_width = 0;
+    ffmpeg_ctx->src_height = 0;
+    ffmpeg_ctx->needs_realloc = false;
+    ffmpeg_ctx->pkt = NULL;
+    ffmpeg_ctx->sws_ctx = NULL;
+    ffmpeg_ctx->current_cache_idx = 0;
+    ffmpeg_ctx->next_cache_idx = 0;
+    ffmpeg_ctx->decoding = false;
+    ffmpeg_ctx->seek_pending = false;
+    ffmpeg_ctx->seek_target = 0;
+    
+    // 初始化互斥锁和信号量
+    pthread_mutex_init(&ffmpeg_ctx->cache_mutex, NULL);
+    sem_init(&ffmpeg_ctx->decode_sem, 0, 0);
+    
+    /* open input file, and allocate format context */
+    if(avformat_open_input(&(ffmpeg_ctx->fmt_ctx), path, NULL, NULL) < 0) {
+        LV_LOG_ERROR("Could not open source file %s", path);
+        goto failed;
+    }
+ 
+    /* retrieve stream information */
+    if(avformat_find_stream_info(ffmpeg_ctx->fmt_ctx, NULL) < 0) {
+        LV_LOG_ERROR("Could not find stream information");
+        goto failed;
+    }
+ 
+    if(ffmpeg_open_codec_context(
+           &(ffmpeg_ctx->video_stream_idx),
+           &(ffmpeg_ctx->video_dec_ctx),
+           ffmpeg_ctx->fmt_ctx, AVMEDIA_TYPE_VIDEO)
+       >= 0) {
+        ffmpeg_ctx->video_stream = ffmpeg_ctx->fmt_ctx->streams[ffmpeg_ctx->video_stream_idx];
+        ffmpeg_ctx->has_alpha = ffmpeg_pix_fmt_has_alpha(ffmpeg_ctx->video_dec_ctx->pix_fmt);
+ 
+#if LV_COLOR_DEPTH == 32
+        ffmpeg_ctx->video_dst_pix_fmt = ffmpeg_ctx->has_alpha ? AV_PIX_FMT_BGRA : AV_PIX_FMT_BGR0;
+#else
+        ffmpeg_ctx->video_dst_pix_fmt = ffmpeg_ctx->has_alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+#endif
+        
+        LV_LOG_INFO("Video pix_fmt: %d, has_alpha: %d, dst_pix_fmt: %d",
+                   ffmpeg_ctx->video_dec_ctx->pix_fmt, 
+                   ffmpeg_ctx->has_alpha,
+                   ffmpeg_ctx->video_dst_pix_fmt);
+    }
+ 
+#if LV_FFMPEG_AV_DUMP_FORMAT != 0
+    /* dump input information to stderr */
+    av_dump_format(ffmpeg_ctx->fmt_ctx, 0, path, 0);
+#endif
+ 
+    if(ffmpeg_ctx->video_stream == NULL) {
+        LV_LOG_ERROR("Could not find video stream in the input, aborting");
+        goto failed;
+    }
+ 
+    return ffmpeg_ctx;
+ 
+failed:
+    ffmpeg_close(ffmpeg_ctx);
+    return NULL;
+}
+ 
+static int ffmpeg_image_allocate(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int ret;
+    
+    if (!ffmpeg_ctx || !ffmpeg_ctx->video_dec_ctx) {
+        LV_LOG_ERROR("Invalid ffmpeg context or codec context");
+        return -1;
+    }
+    
+    // 设置源尺寸
+    ffmpeg_ctx->src_width = ffmpeg_ctx->video_dec_ctx->width;
+    ffmpeg_ctx->src_height = ffmpeg_ctx->video_dec_ctx->height;
+    
+    // 确保目标尺寸有效
+    if(ffmpeg_ctx->target_width <= 0) {
+        ffmpeg_ctx->target_width = ffmpeg_ctx->src_width;
+    }
+    if(ffmpeg_ctx->target_height <= 0) {
+        ffmpeg_ctx->target_height = ffmpeg_ctx->src_height;
+    }
+    
+    // 限制目标尺寸不超过源尺寸
+    ffmpeg_ctx->target_width = LV_MIN(ffmpeg_ctx->target_width, ffmpeg_ctx->src_width);
+    ffmpeg_ctx->target_height = LV_MIN(ffmpeg_ctx->target_height, ffmpeg_ctx->src_height);
+ 
+    // 初始化标志
+    ffmpeg_ctx->needs_realloc = true;
+ 
+    ffmpeg_ctx->frame = av_frame_alloc();
+    if(ffmpeg_ctx->frame == NULL) {
+        LV_LOG_ERROR("Could not allocate frame");
+        return -1;
+    }
+ 
+    ffmpeg_ctx->pkt = av_packet_alloc();
+    if(ffmpeg_ctx->pkt == NULL) {
+        LV_LOG_ERROR("Could not allocate packet");
+        av_frame_free(&ffmpeg_ctx->frame);
+        return -1;
+    }
+ 
+    // 创建缩放上下文
+    int swsFlags = SWS_BILINEAR;
+    ffmpeg_ctx->sws_ctx = sws_getContext(
+        ffmpeg_ctx->src_width, ffmpeg_ctx->src_height, 
+        ffmpeg_ctx->video_dec_ctx->pix_fmt,
+        ffmpeg_ctx->target_width, ffmpeg_ctx->target_height,
+        ffmpeg_ctx->video_dst_pix_fmt,
+        swsFlags, NULL, NULL, NULL);
+        
+    if (!ffmpeg_ctx->sws_ctx) {
+        LV_LOG_ERROR("Failed to create scaling context");
+        av_frame_free(&ffmpeg_ctx->frame);
+        av_packet_free(&ffmpeg_ctx->pkt);
+        return -1;
+    }
+ 
+    // 分配2缓存
+    int frame_size = ffmpeg_ctx->target_width * ffmpeg_ctx->target_height;
+    frame_size *= ffmpeg_ctx->has_alpha ? LV_IMG_PX_SIZE_ALPHA_BYTE : (LV_COLOR_SIZE / 8);
+    
+    for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+        ffmpeg_ctx->frame_cache[i].data = lv_mem_alloc(frame_size);
+        if(!ffmpeg_ctx->frame_cache[i].data) {
+            LV_LOG_ERROR("Failed to allocate frame cache %d", i);
+            // 清理已分配的缓存
+            for(int j = 0; j < i; j++) {
+                lv_mem_free(ffmpeg_ctx->frame_cache[j].data);
+            }
+            av_frame_free(&ffmpeg_ctx->frame);
+            av_packet_free(&ffmpeg_ctx->pkt);
+            return -1;
+        }
+        ffmpeg_ctx->frame_cache[i].ready = false;
+        ffmpeg_ctx->frame_cache[i].pts = 0;
+        ffmpeg_ctx->frame_cache[i].duration = 0;
+    }
+ 
+    LV_LOG_INFO("Image allocated: src=%dx%d, dst=%dx%d", 
+               ffmpeg_ctx->src_width, ffmpeg_ctx->src_height,
+               ffmpeg_ctx->target_width, ffmpeg_ctx->target_height);
+ 
+    return 0;
+}
+ 
+static void ffmpeg_close_src_ctx(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    avcodec_free_context(&(ffmpeg_ctx->video_dec_ctx));
+    avformat_close_input(&(ffmpeg_ctx->fmt_ctx));
+    av_frame_free(&(ffmpeg_ctx->frame));
+    
+    if(ffmpeg_ctx->pkt != NULL) {
+        av_packet_free(&(ffmpeg_ctx->pkt));
+    }
+ 
+}
+ 
+static void ffmpeg_close(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    if(ffmpeg_ctx == NULL) {
+        LV_LOG_WARN("ffmpeg_ctx is NULL");
+        return;
+    }
+ 
+    // 停止解码线程
+    if(ffmpeg_ctx->decoding) {
+        ffmpeg_ctx->decoding = false;
+        sem_post(&ffmpeg_ctx->decode_sem); // 唤醒线程以便退出
+        pthread_join(ffmpeg_ctx->decode_thread, NULL);
+    }
+    // 释放2缓存
+    for(int i = 0; i < MAX_CACHE_FRAMES; i++) {
+        if(ffmpeg_ctx->frame_cache[i].data) {
+            lv_mem_free(ffmpeg_ctx->frame_cache[i].data);
+            ffmpeg_ctx->frame_cache[i].data = NULL;
+        }
+    }    
+    // 销毁同步对象
+    pthread_mutex_destroy(&ffmpeg_ctx->cache_mutex);
+    sem_destroy(&ffmpeg_ctx->decode_sem);
+    sws_freeContext(ffmpeg_ctx->sws_ctx);
+    ffmpeg_close_src_ctx(ffmpeg_ctx);
+    free(ffmpeg_ctx);
+    LV_LOG_INFO("ffmpeg_ctx closed");
+}
+ 
+static void lv_ffmpeg_player_frame_update_cb(lv_timer_t * timer)
+{
+    lv_obj_t * obj = (lv_obj_t *)timer->user_data;
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+ 
+    if(!player->ffmpeg_ctx) {
+        return;
+    }
+ 
+    static int64_t accumulated_delay = 0;
+    static int64_t last_time = 0;
+    int64_t current_time = av_gettime() / 1000;
+    if (last_time == 0) {
+        last_time = current_time;
+    }
+    else
+    {   // 统计延迟时间
+        accumulated_delay += current_time - last_time - player->ffmpeg_ctx->frame_period;
+    }
+    last_time = current_time;
+ 
+    // 检查是否有可用的新帧
+    pthread_mutex_lock(&player->ffmpeg_ctx->cache_mutex);
+    int next_idx = (player->ffmpeg_ctx->current_cache_idx + 1) % MAX_CACHE_FRAMES;
+    
+    // 检查是否有新帧就绪且不是当前显示的帧
+    if(player->ffmpeg_ctx->frame_cache[next_idx].ready && 
+       next_idx != player->ffmpeg_ctx->current_cache_idx) {
+        // 先切换到新帧
+        int old_idx = player->ffmpeg_ctx->current_cache_idx;
+        player->ffmpeg_ctx->current_cache_idx = next_idx;
+        player->imgdsc.data = player->ffmpeg_ctx->frame_cache[next_idx].data;
+        
+        // 旧帧标记为可重用
+        player->ffmpeg_ctx->frame_cache[old_idx].ready = false;
+        
+        // 触发解码线程解码更多帧
+        sem_post(&player->ffmpeg_ctx->decode_sem);
+        
+        // 刷新显示
+        lv_img_cache_invalidate_src(lv_img_get_src(obj));
+        lv_obj_invalidate(obj);
+    }
+    else
+    {
+        // 触发解码线程解码更多帧
+        sem_post(&player->ffmpeg_ctx->decode_sem);
+    }
+    pthread_mutex_unlock(&player->ffmpeg_ctx->cache_mutex);
+ 
+    // 累加延迟时间超过30ms时，加快播放速度
+    if (accumulated_delay > 30) {      
+        lv_timer_set_period(timer, player->ffmpeg_ctx->frame_period * 0.7); // 加快播放
+    }
+    else {
+        lv_timer_set_period(timer, player->ffmpeg_ctx->frame_period); // 恢复播放
+    }
+}
+ 
+static void lv_ffmpeg_player_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj)
+{
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+ 
+    player->auto_restart = false;
+    player->ffmpeg_ctx = NULL;
+    player->timer = NULL;
+    memset(&player->imgdsc, 0, sizeof(lv_img_dsc_t));
+    
+    player->timer = lv_timer_create(lv_ffmpeg_player_frame_update_cb,
+                                    FRAME_DEF_REFR_PERIOD, obj);
+    if(player->timer) {
+        lv_timer_pause(player->timer);
+    }
+    
+    lv_obj_add_event_cb(obj, lv_ffmpeg_player_event_cb, LV_EVENT_SIZE_CHANGED, NULL);
+    
+    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+}
+ 
+static void lv_ffmpeg_player_destructor(const lv_obj_class_t * class_p,
+                                        lv_obj_t * obj)
+{
+    LV_TRACE_OBJ_CREATE("begin");
+ 
+    lv_ffmpeg_player_t * player = (lv_ffmpeg_player_t *)obj;
+ 
+    if(player->timer) {
+        lv_timer_del(player->timer);
+        player->timer = NULL;
+    }
+ 
+    lv_img_cache_invalidate_src(lv_img_get_src(obj));
+    ffmpeg_close(player->ffmpeg_ctx);
+    player->ffmpeg_ctx = NULL;
+ 
+    LV_TRACE_OBJ_CREATE("finished");
+}
+ 
+#endif /*LV_USE_FFMPEG*/

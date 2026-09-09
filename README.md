@@ -31,6 +31,10 @@ lv_port_linux-release-v9.5/
   │ ├── include/  
   │ ├── lib/          #lib.tar.xz: unzip the cross-compiled static library.  
   │ └── share/  
+  ├── zlib/  
+  │ ├── include/  
+  │ ├── lib/  
+  │ └── share/  
   └── sqlite3/        #remove, use sqlite3 amalgamation version.  
 
   

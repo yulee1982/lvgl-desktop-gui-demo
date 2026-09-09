@@ -19,6 +19,8 @@
 #include <libavutil/timestamp.h>
 #include <libswscale/swscale.h>
 
+//#include <libswresample/swresample.h>
+//include <alsa/asoundlib.h>
 /*********************
  *      DEFINES
  *********************/
@@ -37,13 +39,14 @@
 
 #define MY_CLASS (&lv_ffmpeg_player_class)
 
-#define FRAME_DEF_REFR_PERIOD   10  /*[ms] 33*/
+#define FRAME_DEF_REFR_PERIOD   33  /*[ms]*/
 
-#define DECODER_BUFFER_SIZE (128 * 1024) /*[8 * 1024]*/
+#define DECODER_BUFFER_SIZE (64 * 1024) /*[8 * 1024]*/
 
 #define PLAYER_ALIGMENT 32
 #define DECODER_ALIGNMENT 4
 
+#define DECODER_AUDIO   1
 /**********************
  *      TYPEDEFS
  **********************/
@@ -64,10 +67,16 @@ struct ffmpeg_context_s {
     lv_draw_buf_t draw_buf;
     lv_draw_buf_handlers_t draw_buf_handlers;
 
-    uint32_t target_width;
-    uint32_t target_height;
-    uint32_t src_width;
-    uint32_t src_height;
+    uint32_t src_w;
+    uint32_t src_h;
+    uint32_t dst_w;
+    uint32_t dst_h;
+    
+#if DECODER_AUDIO
+    AVCodecContext * audio_dec_ctx;  /* 编解码器上下文，配置参数和状态信息 */
+    AVStream * audio_stream;
+    int audio_stream_idx;
+#endif
 };
 
 #pragma pack(1)
@@ -106,7 +115,9 @@ static bool ffmpeg_pix_fmt_is_yuv(enum AVPixelFormat pix_fmt);
 
 static void lv_ffmpeg_player_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
 static void lv_ffmpeg_player_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
-
+#if DECODER_AUDIO
+static int ffmpeg_output_audio_frame(struct ffmpeg_context_s * ffmpeg_ctx);
+#endif
 /**********************
  *  STATIC VARIABLES
  **********************/
@@ -187,8 +198,14 @@ lv_result_t lv_ffmpeg_player_set_src(lv_obj_t * obj, const char * path)
     lv_timer_pause(player->timer);
 
     player->ffmpeg_ctx = ffmpeg_open_file(path, LV_FFMPEG_PLAYER_USE_LV_FS, player->decoder_name);
-
     if(!player->ffmpeg_ctx) {
+        goto failed;
+    }
+
+    if(ffmpeg_image_allocate(player->ffmpeg_ctx, PLAYER_ALIGMENT) < 0) {
+        LV_LOG_ERROR("ffmpeg image allocate failed");
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
         goto failed;
     }
 //----------------------------------------------------
@@ -196,66 +213,52 @@ lv_result_t lv_ffmpeg_player_set_src(lv_obj_t * obj, const char * path)
     // 获取对象当前尺寸作为目标尺寸
     int obj_width = lv_obj_get_width(obj);
     int obj_height = lv_obj_get_height(obj);
-    LV_LOG_USER("obj_0: width: %d, height: %d", obj_width, obj_height); 
     // 如果对象尺寸为0，使用视频原始尺寸
     if(obj_width <= 0 || obj_height <= 0) {
         obj_width = player->ffmpeg_ctx->video_dec_ctx->width;
         obj_height = player->ffmpeg_ctx->video_dec_ctx->height;
         // 设置对象尺寸
         lv_obj_set_size(obj, obj_width, obj_height);
-        LV_LOG_USER("obj_1: width: %d, height: %d", obj_width, obj_height); 
     }
-    
     // 设置目标尺寸 - 确保不超过视频原始尺寸
-    player->ffmpeg_ctx->src_width = player->ffmpeg_ctx->video_dec_ctx->width;
-    player->ffmpeg_ctx->src_height = player->ffmpeg_ctx->video_dec_ctx->height;
+    player->ffmpeg_ctx->src_w = player->ffmpeg_ctx->video_dec_ctx->width;
+    player->ffmpeg_ctx->src_h = player->ffmpeg_ctx->video_dec_ctx->height;
 
     lv_coord_t video_w = 0, video_h = 0;
-    if (obj_width * player->ffmpeg_ctx->src_height > 
-            obj_height * player->ffmpeg_ctx->src_width)
+    if (obj_width * player->ffmpeg_ctx->src_h > obj_height * player->ffmpeg_ctx->src_w)
     { // 以高度为基准
         video_h = obj_height;
-        video_w = (obj_height * player->ffmpeg_ctx->src_width) / player->ffmpeg_ctx->src_height;
+        video_w = (obj_height * player->ffmpeg_ctx->src_w) / player->ffmpeg_ctx->src_h;
         // 确保不超过原始尺寸
-        if (video_h > player->ffmpeg_ctx->src_height) {
-            video_h = player->ffmpeg_ctx->src_height;
-            video_w = player->ffmpeg_ctx->src_width;
+        if (video_h > player->ffmpeg_ctx->src_h) {
+            video_h = player->ffmpeg_ctx->src_h;
+            video_w = player->ffmpeg_ctx->src_w;
         }
     } else { // 以宽度为基准
         video_w = obj_width;
-        video_h = (obj_width * player->ffmpeg_ctx->src_height) / player->ffmpeg_ctx->src_width;
+        video_h = (obj_width * player->ffmpeg_ctx->src_h) / player->ffmpeg_ctx->src_w;
         // 确保不超过原始尺寸
-        if (video_w > player->ffmpeg_ctx->src_width) {
-            video_w = player->ffmpeg_ctx->src_width;
-            video_h = player->ffmpeg_ctx->src_height;
+        if (video_w > player->ffmpeg_ctx->src_w) {
+            video_w = player->ffmpeg_ctx->src_w;
+            video_h = player->ffmpeg_ctx->src_h;
         }
     }
-    //player->ffmpeg_ctx->target_width = LV_MIN(obj_width, player->ffmpeg_ctx->video_dec_ctx->width);
-    //player->ffmpeg_ctx->target_height = LV_MIN(obj_height, player->ffmpeg_ctx->video_dec_ctx->height);
-    player->ffmpeg_ctx->target_width = video_w;
-    player->ffmpeg_ctx->target_height = video_h;
-    LV_LOG_USER("video_src: width: %d, height: %d", player->ffmpeg_ctx->src_width, player->ffmpeg_ctx->src_height); 
-    LV_LOG_USER("video_target: width: %d, height: %d", player->ffmpeg_ctx->target_width, player->ffmpeg_ctx->target_height); 
+    player->ffmpeg_ctx->dst_w = video_w;
+    player->ffmpeg_ctx->dst_h = video_h;
 //----------------------------------------------------
-    if(ffmpeg_image_allocate(player->ffmpeg_ctx, PLAYER_ALIGMENT) < 0) {
-        LV_LOG_ERROR("ffmpeg image allocate failed");
-        ffmpeg_close(player->ffmpeg_ctx);
-        player->ffmpeg_ctx = NULL;
-        goto failed;
-    }
 
     bool has_alpha = player->ffmpeg_ctx->has_alpha;
-    //int width = player->ffmpeg_ctx->video_dec_ctx->width;
-    //int height = player->ffmpeg_ctx->video_dec_ctx->height;
+    int width = player->ffmpeg_ctx->dst_w;//player->ffmpeg_ctx->video_dec_ctx->width;
+    int height = player->ffmpeg_ctx->dst_h;//player->ffmpeg_ctx->video_dec_ctx->height;
 
     uint8_t * data = ffmpeg_get_image_data(player->ffmpeg_ctx);
     lv_color_format_t cf = has_alpha ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_NATIVE;
-    uint32_t stride = player->ffmpeg_ctx->target_width * lv_color_format_get_size(cf);
-    uint32_t data_size = stride * player->ffmpeg_ctx->target_height;
+    uint32_t stride = width * lv_color_format_get_size(cf);
+    uint32_t data_size = stride * height;
     lv_memzero(data, data_size);
 
-    player->imgdsc.header.w = player->ffmpeg_ctx->target_width;//width;
-    player->imgdsc.header.h = player->ffmpeg_ctx->target_height;//height;
+    player->imgdsc.header.w = width;
+    player->imgdsc.header.h = height;
     player->imgdsc.data_size = data_size;
     player->imgdsc.header.cf = cf;
     player->imgdsc.header.stride = stride;
@@ -522,21 +525,16 @@ static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx)
             }
         }
 
-        /*ffmpeg_ctx->sws_ctx = sws_getContext(
-                                  width, height, ffmpeg_ctx->video_dec_ctx->pix_fmt,
-                                  width, height, ffmpeg_ctx->video_dst_pix_fmt,
-                                  swsFlags,
-                                  NULL, NULL, NULL);*/
         ffmpeg_ctx->sws_ctx = sws_getContext(
                                   width, height, ffmpeg_ctx->video_dec_ctx->pix_fmt,
-                                  ffmpeg_ctx->target_width, ffmpeg_ctx->target_height,
+                                  ffmpeg_ctx->dst_w, ffmpeg_ctx->dst_h,
                                   ffmpeg_ctx->video_dst_pix_fmt,
                                   swsFlags,
                                   NULL, NULL, NULL);
     }
 
     if(!ffmpeg_ctx->has_alpha) {
-        int lv_linesize = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE) * ffmpeg_ctx->target_width; //
+        int lv_linesize = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE) * ffmpeg_ctx->dst_w;
         int dst_linesize = ffmpeg_ctx->video_dst_linesize[0];
         if(dst_linesize != lv_linesize) {
             LV_LOG_WARN("ffmpeg linesize = %d, but lvgl image require %d",
@@ -558,6 +556,13 @@ static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx)
 failed:
     return ret;
 }
+
+#if DECODER_AUDIO
+static int ffmpeg_output_audio_frame(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+
+}
+#endif
 
 static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt,
                                 struct ffmpeg_context_s * ffmpeg_ctx)
@@ -593,7 +598,12 @@ static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt,
         if(dec->codec->type == AVMEDIA_TYPE_VIDEO) {
             ret = ffmpeg_output_video_frame(ffmpeg_ctx);
         }
-
+#if DECODER_AUDIO
+        /* write the frame data to output file */
+        if(dec->codec->type == AVMEDIA_TYPE_AUDIO) {
+            ret = ffmpeg_output_audio_frame(ffmpeg_ctx);
+        }
+#endif
         av_frame_unref(ffmpeg_ctx->frame);
         if(ret < 0) {
             LV_LOG_WARN("ffmpeg_decode_packet ended %d", ret);
@@ -652,8 +662,7 @@ static int ffmpeg_open_codec_context(int * stream_idx,
         LV_LOG_ERROR("Could not find %s stream in input file",
                      av_get_media_type_string(type));
         return ret;
-    }
-    else {
+    } else {
         stream_index = ret;
         st = fmt_ctx->streams[stream_index];
 
@@ -780,7 +789,13 @@ static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx)
                                            ffmpeg_ctx->pkt, ffmpeg_ctx);
                 is_image = true;
             }
-
+#if DECODER_AUDIO
+            if(ffmpeg_ctx->pkt->stream_index == ffmpeg_ctx->audio_stream_idx) {
+                ret = ffmpeg_decode_packet(ffmpeg_ctx->audio_dec_ctx,
+                                           ffmpeg_ctx->pkt, ffmpeg_ctx);
+                is_image = true;
+            }
+#endif
             av_packet_unref(ffmpeg_ctx->pkt);
 
             if(ret < 0) {
@@ -906,16 +921,40 @@ static struct ffmpeg_context_s * ffmpeg_open_file(const char * path, bool is_lv_
 
         ffmpeg_ctx->video_dst_pix_fmt = (ffmpeg_ctx->has_alpha ? AV_PIX_FMT_BGRA : AV_PIX_FMT_TRUE_COLOR);
     }
+    
+#if LV_FFMPEG_DUMP_FORMAT
+    /* dump input information to stderr */
+    av_dump_format(ffmpeg_ctx->fmt_ctx, 0, path, 0);
+#endif
+
+#if DECODER_AUDIO 
+    if(ffmpeg_open_codec_context(
+           &(ffmpeg_ctx->audio_stream_idx),
+           &(ffmpeg_ctx->audio_dec_ctx),
+           ffmpeg_ctx->fmt_ctx, AVMEDIA_TYPE_AUDIO, decoder_name)
+       >= 0) {
+        ffmpeg_ctx->audio_stream = ffmpeg_ctx->fmt_ctx->streams[ffmpeg_ctx->audio_stream_idx];
+    }
+#endif
 
 #if LV_FFMPEG_DUMP_FORMAT
     /* dump input information to stderr */
     av_dump_format(ffmpeg_ctx->fmt_ctx, 0, path, 0);
 #endif
 
-    if(ffmpeg_ctx->video_stream == NULL) {
+#if DECODER_AUDIO 
+    if((ffmpeg_ctx->video_stream == NULL) || (ffmpeg_ctx->audio_stream == NULL))
+    {
+        LV_LOG_ERROR("Could not find video or stream audio in the input, aborting");
+        goto failed;
+    }
+#else
+    if(ffmpeg_ctx->video_stream == NULL)
+    {
         LV_LOG_ERROR("Could not find video stream in the input, aborting");
         goto failed;
     }
+#endif
 
     return ffmpeg_ctx;
 
