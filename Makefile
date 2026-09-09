@@ -15,14 +15,18 @@ WARNINGS        := -Wall -Wshadow -Wundef -Wmissing-prototypes -Wno-discarded-qu
                    -Wno-ignored-qualifiers -Wno-error=pedantic -Wno-sign-compare -Wno-error=missing-prototypes -Wdouble-promotion -Wclobbered -Wdeprecated -Wempty-body \
                    -Wshift-negative-value -Wstack-usage=2048 -Wno-unused-value -std=gnu99
 
+ZLIB_INCLUDE_DIR = ./thirdpart/zlib/include
+ZLIB_LIB_DIR = ./thirdpart/zlib/lib
 FFMPEG_INCLUDE_DIR = ./thirdpart/ffmpeg-9.0.1/include
 FFMPEG_LIB_DIR = ./thirdpart/ffmpeg-9.0.1/lib
 
 CFLAGS          ?= -O3 -g0 -I$(LVGL_DIR)/ $(WARNINGS)
+CFLAGS          += -I$(ZLIB_INCLUDE_DIR)/
 CFLAGS          += -I$(FFMPEG_INCLUDE_DIR)/
 
-LDFLAGS         += -L$(FFMPEG_LIB_DIR) -lavformat -lavcodec -lswscale -lavutil
-LDFLAGS         += -lpthread -ldl -latomic -static -lm
+LDFLAGS         += -L$(ZLIB_LIB_DIR) -lz
+LDFLAGS         += -L$(FFMPEG_LIB_DIR) -lavformat -lavcodec -lswresample -lswscale -lavutil
+LDFLAGS         += -lm -lz -static -ldl -latomic -lpthread
 
 BIN             = main
 BUILD_DIR       = ./build

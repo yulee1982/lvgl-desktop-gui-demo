@@ -1,0 +1,14 @@
+prefix=/home/yulee/work/s5p6818/gui_lv_v9.5/lv_port_linux-release-v9.5/thirdpart/ffmpeg-9.0.1
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${exec_prefix}/include
+
+Name: libswresample
+Description: FFmpeg audio resampling library
+Version: 7.1.101
+Requires: 
+Requires.private: libavutil >= 61.1.101
+Conflicts:
+Libs: -L${libdir}  -lswresample 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}

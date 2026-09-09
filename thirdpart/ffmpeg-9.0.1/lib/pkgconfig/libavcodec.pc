@@ -1,7 +1,7 @@
 prefix=/home/yulee/work/s5p6818/gui_lv_v9.5/lv_port_linux-release-v9.5/thirdpart/ffmpeg-9.0.1
 exec_prefix=${prefix}
-libdir=/usr/local/ffmpeg-9.0.1-aarch64/lib
-includedir=/usr/local/ffmpeg-9.0.1-aarch64/include
+libdir=${exec_prefix}/lib
+includedir=${exec_prefix}/include
 
 Name: libavcodec
 Description: FFmpeg codec library

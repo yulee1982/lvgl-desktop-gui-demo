@@ -1,0 +1,14 @@
+prefix=/home/yulee/work/s5p6818/gui_lv_v9.5/lv_port_linux-release-v9.5/thirdpart/ffmpeg-9.0.1
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${exec_prefix}/include
+
+Name: libavdevice
+Description: FFmpeg device handling library
+Version: 63.1.101
+Requires: 
+Requires.private: libavfilter >= 12.1.101, libswscale >= 10.1.101, libavformat >= 63.1.101, libavcodec >= 63.1.101, libswresample >= 7.1.101, libavutil >= 61.1.101
+Conflicts:
+Libs: -L${libdir}  -lavdevice 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}

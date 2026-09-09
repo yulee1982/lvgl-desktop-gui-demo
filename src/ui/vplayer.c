@@ -1,14 +1,14 @@
 ﻿#include "vplayer.h"
 #include "lv_app_conf.h"
 #include <stdlib.h>
-
+/*
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/timestamp.h>
 #include <libswscale/swscale.h>
-
+*/
 // 按钮事件处理函数
 static void play_btn_event_cb(lv_event_t *e)
 {
