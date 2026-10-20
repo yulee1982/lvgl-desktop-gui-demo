@@ -174,7 +174,7 @@ lv_res_t vplayer_set_src(vplayer_t *vplayer, const char *path)
     int ret = pthread_create(&ffplay_tid, NULL, ffplay_main, vplayer);
     if(ret != 0)
         return LV_RES_INV;
-    //vplayer_play(vplayer);
+    vplayer_play(vplayer);
     return LV_RES_OK; 
 //--------------------------------------------------------
     /*
